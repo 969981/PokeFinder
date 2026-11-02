@@ -1,0 +1,250 @@
+name: PokeFinder - Sync Official Upstream and Release
+
+on:
+  schedule:
+    # Every 10 minutes (GitHub scheduled runs can be delayed).
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+  push:
+    # Default branch is bdsp-fishing-fix. Schedule must live here.
+    branches: [bdsp-fishing-fix]
+    paths: ['.github/workflows/pokefinder-upstream-release.yml']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pokefinder-official-sync-and-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Safely sync Admiral-Fish/master
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.ff.outputs.changed }}
+      sha: ${{ steps.ff.outputs.sha }}
+    steps:
+      - name: Checkout local master with full history
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fast-forward from official upstream (never force-push)
+        id: ff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/Admiral-Fish/PokeFinder.git
+          git fetch --no-tags upstream master
+          current_sha="$(git rev-parse HEAD)"
+          new_sha="$(git rev-parse FETCH_HEAD)"
+          echo "sha=$new_sha" >> "$GITHUB_OUTPUT"
+          if [[ "$current_sha" == "$new_sha" ]]; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            echo "Already up to date: $new_sha"
+            exit 0
+          fi
+          if ! git merge-base --is-ancestor "$current_sha" "$new_sha"; then
+            echo "::error::Local master diverged from official master; refusing destructive sync."
+            exit 1
+          fi
+          git push origin "$new_sha:refs/heads/master"
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+          echo "Fast-forwarded: $current_sha -> $new_sha"
+
+  build:
+    name: Build / test / bundle ${{ matrix.platform }}
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            platform: Windows
+            cache-key: windows
+            qt-archives: qtbase qtsvg qttools
+            qt-tools: tools_opensslv3_x64
+          - os: ubuntu-24.04
+            platform: Linux
+            cache-key: linux
+            qt-archives: icu qtbase qtsvg qttools
+            qt-tools: ''
+          - os: macos-15
+            platform: macOS
+            cache-key: macos
+            qt-archives: qtbase qtsvg qttools
+            qt-tools: ''
+    env:
+      CC: ${{ matrix.platform == 'Linux' && 'gcc-14' || '' }}
+      CXX: ${{ matrix.platform == 'Linux' && 'g++-14' || '' }}
+    steps:
+      - name: Checkout exact official commit, including submodules
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Install Python 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Install Windows tools
+        if: matrix.platform == 'Windows'
+        shell: pwsh
+        run: choco install ninja -y --no-progress
+
+      - name: Install Linux tools
+        if: matrix.platform == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y appstream ninja-build libfuse2
+
+      - name: Install macOS tools
+        if: matrix.platform == 'macOS'
+        shell: bash
+        run: brew install ninja
+
+      - name: Install Qt 6.10.1
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.10.1'
+          archives: ${{ matrix.qt-archives }}
+          tools: ${{ matrix.qt-tools }}
+          cache: true
+
+      - name: Configure MSVC (Windows)
+        if: matrix.platform == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTEST=ON \
+            ${{ matrix.platform == 'macOS' && '-DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"' || '' }}
+
+      - name: Build
+        run: cmake --build build --parallel 2
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Bundle Windows exe and Qt runtime
+        if: matrix.platform == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path PokeFinder | Out-Null
+          Move-Item build/PokeFinder.exe PokeFinder/PokeFinder.exe
+          windeployqt --no-translations --no-plugins --no-opengl-sw --no-system-d3d-compiler PokeFinder/PokeFinder.exe
+          if ($LASTEXITCODE -ne 0) { throw 'windeployqt failed' }
+          New-Item -ItemType Directory -Force -Path PokeFinder/platforms, PokeFinder/styles | Out-Null
+          Copy-Item "$env:QT_ROOT_DIR/plugins/platforms/qwindows.dll" PokeFinder/platforms/
+          Copy-Item "$env:QT_ROOT_DIR/plugins/styles/qmodernwindowsstyle.dll" PokeFinder/styles/
+          Copy-Item "$env:QT_ROOT_DIR/../../Tools/OpenSSLv3/Win_x64/bin/lib*.dll" PokeFinder/
+          Remove-Item PokeFinder/vc_redist*.exe -ErrorAction SilentlyContinue
+          7z a PokeFinder-windows-x64.zip PokeFinder
+          if ($LASTEXITCODE -ne 0) { throw '7z failed' }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Move-Item PokeFinder-windows-x64.zip dist/
+
+      - name: Bundle Linux executable and AppImage
+        if: matrix.platform == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x linuxdeploy-*.AppImage
+          export QMAKE="$QT_ROOT_DIR/bin/qmake"
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir --plugin qt \
+            -e build/PokeFinder \
+            -d Form/io.github.admiral_fish.pokefinder.desktop \
+            -i Form/Images/Icon/pokefinder_16x16.png \
+            -i Form/Images/Icon/pokefinder_24x24.png \
+            -i Form/Images/Icon/pokefinder_32x32.png \
+            -i Form/Images/Icon/pokefinder_48x48.png \
+            -i Form/Images/Icon/pokefinder_256x256.png \
+            --icon-filename io.github.admiral_fish.pokefinder
+          mkdir -p AppDir/usr/share/metainfo
+          cp Form/io.github.admiral_fish.pokefinder.appdata.xml AppDir/usr/share/metainfo/
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir --output appimage
+          mkdir -p dist
+          mv PokéFinder-x86_64.AppImage dist/PokeFinder-linux-x86_64.AppImage
+          tar czf dist/PokeFinder-linux-x86_64.tar.gz -C build PokeFinder
+
+      - name: Bundle macOS universal app
+        if: matrix.platform == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mv build/PokeFinder.app .
+          macdeployqt PokeFinder.app -verbose=2
+          mkdir -p dist
+          tar czf dist/PokeFinder-macOS-universal.tar.gz PokeFinder.app
+
+      - name: Upload packaged files
+        uses: actions/upload-artifact@v4
+        with:
+          name: PokeFinder-dist-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Release all three OS builds together
+    needs: [sync, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all successful platform archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: PokeFinder-dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check all four expected deliverables
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s dist/PokeFinder-windows-x64.zip
+          test -s dist/PokeFinder-linux-x86_64.tar.gz
+          test -s dist/PokeFinder-linux-x86_64.AppImage
+          test -s dist/PokeFinder-macOS-universal.tar.gz
+          (cd dist && sha256sum PokeFinder-* > SHA256SUMS.txt)
+          ls -lh dist
+
+      - name: Publish only when every platform succeeded
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.sync.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="upstream-${SHA:0:12}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists; skipping duplicate."
+            exit 0
+          fi
+          gh release create "$tag" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
+            --title "PokeFinder upstream ${SHA:0:12} — Windows / Linux / macOS" \
+            --latest \
+            --notes "Automatic unmodified-source build of Admiral-Fish/PokeFinder master.
+
+          Upstream: https://github.com/Admiral-Fish/PokeFinder
+          Commit: $SHA
+
+          Assets: Windows x64 (Qt bundled), Linux x86_64 (binary and AppImage), macOS universal (x86_64 and arm64).
+          CMake build and test suite passed on all three platforms.
+          This is an independently built community mirror, not an official upstream binary.
+          Custom branches and their history are retained."
